@@ -64,7 +64,7 @@ async function saveKey(key, value) {
 const SERVICES = [
   { key: "monthly_bookkeeping", label: "Monthly Bookkeeping & Reconciliation" },
   { key: "catchup_cleanup", label: "Catch-Up / Cleanup Bookkeeping" },
-  { key: "ap_management", label: "Accounts Payable / Bill Pay" },
+  { key: "ap_management", label: "Accounts Payable Management" },
   { key: "ar_invoicing", label: "Accounts Receivable / Invoicing" },
   { key: "payroll_support", label: "Payroll Processing Support" },
   { key: "financial_reporting", label: "Monthly Financial Reporting" },
@@ -78,9 +78,25 @@ const ONBOARDING_TASKS = [
   { key: "engagement_signed", label: "Engagement letter signed" },
   { key: "payment_setup", label: "Payment authorization on file" },
   { key: "software_access", label: "Accounting software access granted" },
-  { key: "bank_access", label: "Bank feed / read-only access connected" },
-  { key: "cc_access", label: "Credit card feed connected" },
-  { key: "payroll_access", label: "Payroll system access (if applicable)" },
+  {
+    key: "bank_access",
+    label: "Bank feed / read-only access connected",
+    // Explicit 0 bank accounts makes this task not applicable; blank keeps it.
+    applies: (c) => parseCount(c.bankAccounts) !== 0,
+    naReason: "no bank accounts",
+  },
+  {
+    key: "cc_access",
+    label: "Credit card feed connected",
+    applies: (c) => parseCount(c.ccAccounts) !== 0,
+    naReason: "no credit cards",
+  },
+  {
+    key: "payroll_access",
+    label: "Payroll system access",
+    applies: (c) => Boolean(c.hasPayroll),
+    naReason: "no payroll",
+  },
   { key: "docs_received", label: "Onboarding documents received" },
   { key: "chart_of_accounts", label: "Chart of accounts reviewed" },
   { key: "opening_balances", label: "Opening balances entered" },
@@ -109,6 +125,13 @@ const SOFTWARE = [
 ];
 
 const STATUSES = ["Lead", "Onboarding", "Active", "Paused"];
+
+// Who releases payments when Accounts Payable Management is selected.
+// "client" is the default: the bookkeeper holds no payment authority.
+const BILL_PAY_OPTIONS = [
+  { key: "client", label: "Client approves and pays all bills" },
+  { key: "provider", label: "We schedule payments the client has approved" },
+];
 
 /* ------------------------------------------------------------------ */
 /* Blank records                                                       */
@@ -166,7 +189,12 @@ function blankClient() {
     billing: "Monthly",
     startDate: "",
     status: "Lead",
+    billPayAuthority: "client",
+    specialTerms: "",
     notes: "",
+    // New clients start reviewed; legacy clients with notes are flagged on
+    // load so their notes get checked for client-facing terms.
+    notesReviewed: true,
     // Tracking
     tasks,
   };
@@ -232,6 +260,73 @@ function selectedServices(c) {
   return SERVICES.filter((s) => c.services.includes(s.key));
 }
 
+function hasAP(c) {
+  return c.services.includes("ap_management");
+}
+
+function billPayLabel(c) {
+  const opt = BILL_PAY_OPTIONS.find((o) => o.key === c.billPayAuthority);
+  return (opt || BILL_PAY_OPTIONS[0]).label;
+}
+
+// Billing: "Per project" is a single charge; Monthly/Quarterly recur.
+function isOneTime(c) {
+  return c.billing === "Per project";
+}
+
+function billingPhrase(c) {
+  if (isOneTime(c)) return "billed once for the project";
+  if (c.billing === "Quarterly") return "billed quarterly";
+  if (c.billing === "Monthly") return "billed monthly";
+  return `billed ${v(c.billing, "Billing Frequency")}`;
+}
+
+// Flags fee text that contradicts the billing type (non-blocking).
+function feeBillingWarning(c) {
+  const fee = (c.fee || "").toLowerCase();
+  if (!fee) return "";
+  const saysOneTime = /one[- ]?time|project/.test(fee);
+  const saysMonthly = /\/\s*mo\b|monthly|per month|a month/.test(fee);
+  const saysQuarterly = /quarter/.test(fee);
+  if (!isOneTime(c) && saysOneTime)
+    return `Fee text mentions a one-time project fee, but billing is ${c.billing}. Check that they match.`;
+  if (isOneTime(c) && (saysMonthly || saysQuarterly))
+    return "Fee text mentions a recurring fee, but billing is Per project. Check that they match.";
+  if (c.billing === "Quarterly" && saysMonthly)
+    return "Fee text mentions a monthly fee, but billing is Quarterly. Check that they match.";
+  if (c.billing === "Monthly" && saysQuarterly)
+    return "Fee text mentions a quarterly fee, but billing is Monthly. Check that they match.";
+  return "";
+}
+
+// Counts (bank accounts, credit cards, cleanup months): optional, but when
+// present must be a whole number >= 0.
+const COUNT_FIELDS = ["bankAccounts", "ccAccounts", "cleanupMonths"];
+
+function countError(value) {
+  const s = value == null ? "" : String(value).trim();
+  if (!s) return "";
+  return /^\d+$/.test(s) ? "" : "Enter a whole number, 0 or more, or leave blank.";
+}
+
+// Integer, or null when blank or invalid.
+function parseCount(value) {
+  const s = value == null ? "" : String(value).trim();
+  return /^\d+$/.test(s) ? parseInt(s, 10) : null;
+}
+
+// Document text for a count: the number, or a bracketed placeholder.
+function countText(value) {
+  const s = value == null ? "" : String(value).trim();
+  if (!s) return "[Not provided]";
+  const n = parseCount(s);
+  return n === null ? "[Check count]" : String(n);
+}
+
+function taskApplies(t, c) {
+  return t.applies ? t.applies(c) : true;
+}
+
 function bulletList(items) {
   return items.map((i) => `  • ${i}`).join("\n");
 }
@@ -247,9 +342,39 @@ function genEngagement(c, s) {
     ? bulletList(services.map((x) => x.label))
     : "  • [No services selected yet — choose services on the client form]";
 
-  const fee = v(c.fee || s.defaultFee, "Monthly Fee");
-  const billing = v(c.billing, "Billing Frequency");
+  const apTerms = !hasAP(c)
+    ? ""
+    : c.billPayAuthority === "provider"
+    ? `
+Accounts payable: We will enter and track bills and schedule a payment only
+after you have approved it. You keep final authority over your accounts and
+remain responsible for having funds available.
+`
+    : `
+Accounts payable: We will enter and track bills and prepare a list of
+payments due for your review. You approve and release every payment. We will
+not initiate payments or hold payment authority on your accounts.
+`;
+
+  const specialTerms = (c.specialTerms || "").trim() || "None.";
+
+  const fee = v(c.fee || s.defaultFee, "Fee");
   const governing = v(s.governingState, "Governing State");
+  const oneTime = isOneTime(c);
+
+  const paymentSentence = oneTime
+    ? "The one-time payment is authorized separately via the Payment\nAuthorization form."
+    : "Recurring payment is authorized separately via the Payment Authorization\nform.";
+
+  const termText = oneTime
+    ? `This engagement begins on ${v(c.startDate, "Start Date")} and ends when the project is
+complete, unless either party ends it earlier with written notice. Upon
+completion or termination, we will provide your books and records in a
+standard exportable format.`
+    : `This engagement begins on ${v(c.startDate, "Start Date")} and continues until
+terminated by either party with thirty (30) days' written notice. Upon
+termination, we will provide your books and records in a standard exportable
+format.`;
 
   return `ENGAGEMENT LETTER & BOOKKEEPING SERVICE AGREEMENT
 
@@ -273,7 +398,7 @@ provide bookkeeping services to ${v(c.legalName, "Client Legal Name")} ("you,"
 1. SCOPE OF SERVICES
 We will provide the following bookkeeping services:
 ${scope}
-
+${apTerms}
 Accounting basis: ${v(c.basis, "Cash/Accrual")}.
 Reporting frequency: ${v(c.frequency, "Frequency")}.
 Primary accounting software: ${v(c.software, "Software")}.
@@ -292,31 +417,30 @@ recommend you engage a licensed CPA, Enrolled Agent, or attorney. We are
 happy to coordinate with your tax professional and provide them with clean,
 reconciled books.
 
-3. CLIENT RESPONSIBILITIES
+3. SPECIAL TERMS & LIMITATIONS
+${specialTerms}
+
+4. CLIENT RESPONSIBILITIES
 You are responsible for the accuracy and completeness of the information and
 source documents you provide, for the safeguarding of assets, and for all
 management decisions. You will provide timely access to records and respond
 to our requests for clarification.
 
-4. FEES & BILLING
-Fee: ${fee}, billed ${billing}.
-Invoices are due upon receipt unless otherwise agreed. Recurring payment is
-authorized separately via the Payment Authorization form.
+5. FEES & BILLING
+Fee: ${fee}, ${billingPhrase(c)}.
+Invoices are due upon receipt unless otherwise agreed. ${paymentSentence}
 
-5. TERM & TERMINATION
-This engagement begins on ${v(c.startDate, "Start Date")} and continues until
-terminated by either party with thirty (30) days' written notice. Upon
-termination, we will provide your books and records in a standard exportable
-format.
+6. TERM & TERMINATION
+${termText}
 
-6. CONFIDENTIALITY
+7. CONFIDENTIALITY
 We will keep your financial information confidential and will not disclose it
 except as required to perform the services or as required by law.
 
-7. GOVERNING LAW
+8. GOVERNING LAW
 This agreement is governed by the laws of the State of ${governing}.
 
-8. ACCEPTANCE
+9. ACCEPTANCE
 By signing below, both parties agree to the terms above.
 
 Client: ______________________________   Date: ______________
@@ -363,19 +487,27 @@ Address:           ${fullAddress(c.street, c.city, c.state, c.zip).replace(/\n/g
 Fiscal year end:   ${v(c.fiscalYearEnd, "FYE")}
 Accounting basis:  ${v(c.basis, "Cash/Accrual")}
 Software:          ${v(c.software, "Software")}
-Bank accounts:     ${v(c.bankAccounts, "0")}
-Credit cards:      ${v(c.ccAccounts, "0")}
+Bank accounts:     ${countText(c.bankAccounts)}
+Credit cards:      ${countText(c.ccAccounts)}
 Monthly txn vol.:  ${v(c.monthlyVolume, "Unknown")}
 Payroll:           ${c.hasPayroll ? "Yes — " + v(c.payrollProvider, "Provider") : "No"}
-Cleanup needed:    ${c.cleanupMonths ? c.cleanupMonths + " month(s)" : "None / TBD"}
+Cleanup needed:    ${
+    parseCount(c.cleanupMonths) > 0
+      ? parseCount(c.cleanupMonths) + " month(s)"
+      : countError(c.cleanupMonths)
+      ? "[Check count]"
+      : "None / TBD"
+  }
 
 ── ENGAGEMENT ──
 Services:
 ${serviceList}
 Frequency:         ${v(c.frequency, "Frequency")}
 Fee:               ${v(c.fee || s.defaultFee, "Fee")}
-Billing:           ${v(c.billing, "Billing")}
+Billing:           ${billingPhrase(c)}
 Start date:        ${v(c.startDate, "Start Date")}
+Bill payment:      ${hasAP(c) ? billPayLabel(c) : "n/a (AP not selected)"}
+Special terms:     ${(c.specialTerms || "").trim() || "None"}
 
 ── NOTES ──
 ${c.notes ? c.notes : "[No notes]"}`;
@@ -390,8 +522,11 @@ function genDocChecklist(c, s) {
     "Most recent financial statements (P&L and Balance Sheet, if available)",
   ];
 
-  const banks = parseInt(c.bankAccounts, 10);
-  if (banks > 0) {
+  // Explicit 0 omits the request; blank or invalid keeps the generic one.
+  const banks = parseCount(c.bankAccounts);
+  if (banks === 0) {
+    /* no business bank accounts */
+  } else if (banks > 0) {
     items.push(
       `Last 3 months of statements for each business bank account (${banks} account${
         banks === 1 ? "" : "s"
@@ -401,8 +536,10 @@ function genDocChecklist(c, s) {
     items.push("Last 3 months of statements for each business bank account");
   }
 
-  const cards = parseInt(c.ccAccounts, 10);
-  if (cards > 0) {
+  const cards = parseCount(c.ccAccounts);
+  if (cards === 0) {
+    /* no business credit cards */
+  } else if (cards > 0) {
     items.push(
       `Last 3 months of statements for each business credit card (${cards} card${
         cards === 1 ? "" : "s"
@@ -426,10 +563,9 @@ function genDocChecklist(c, s) {
     items.push("Most recent payroll tax filings (940/941, state)");
   }
 
-  if (c.cleanupMonths) {
-    items.push(
-      `Records covering the ${c.cleanupMonths}-month cleanup period`
-    );
+  const cleanup = parseCount(c.cleanupMonths);
+  if (cleanup > 0) {
+    items.push(`Records covering the ${cleanup}-month cleanup period`);
   }
 
   return `WELCOME — DOCUMENT REQUEST CHECKLIST
@@ -482,8 +618,8 @@ login.
 2. BANK & CREDIT CARD FEEDS
 We request READ-ONLY connections (bank feeds) or read-only viewer access so
 transactions flow automatically into ${v(c.software, "your accounting software")}.
-  • Business bank accounts to connect: ${v(c.bankAccounts, "0")}
-  • Business credit cards to connect:  ${v(c.ccAccounts, "0")}
+  • Business bank accounts to connect: ${countText(c.bankAccounts)}
+  • Business credit cards to connect:  ${countText(c.ccAccounts)}
 
 3. PAYROLL (IF APPLICABLE)
 ${
@@ -494,7 +630,15 @@ ${
         )}. Please add us as a reports-only / accountant user.`
       : "No payroll access requested at this time."
   }
-
+${
+    hasAP(c) && c.billPayAuthority === "provider"
+      ? `
+4. BILL PAYMENT PLATFORM
+Add us with a role that can prepare payments. You keep approver rights, and
+no payment is released without your approval.
+`
+      : ""
+  }
 IMPORTANT SECURITY NOTES — PLEASE READ:
   • NEVER send us your passwords. We will never ask for them.
   • NEVER send full bank or credit card account numbers by email or text.
@@ -511,20 +655,46 @@ ${v(c.legalName, "Client Legal Name")}`;
 }
 
 function genPaymentAuth(c, s) {
-  const fee = v(c.fee || s.defaultFee, "Monthly Fee");
-  const billing = v(c.billing, "Billing Frequency");
-  return `RECURRING PAYMENT AUTHORIZATION
+  const fee = v(c.fee || s.defaultFee, "Fee");
+  const oneTime = isOneTime(c);
+  const client = `${v(c.legalName, "Client Legal Name")}${c.dba ? ` (DBA "${c.dba}")` : ""}`;
 
-Client: ${v(c.legalName, "Client Legal Name")}${c.dba ? ` (DBA "${c.dba}")` : ""}
+  const header = oneTime
+    ? "ONE-TIME PAYMENT AUTHORIZATION"
+    : "RECURRING PAYMENT AUTHORIZATION";
+
+  const authorize = oneTime
+    ? `I authorize ${providerLine(s)} to charge the payment method on file once
+for the project described in the signed Engagement Letter.`
+    : `I authorize ${providerLine(s)} to charge the payment method on file for
+bookkeeping services per the signed Engagement Letter.`;
+
+  const schedule = oneTime
+    ? `  Amount:     ${fee}
+  Frequency:  One-time (per project)
+  Start date: ${v(c.startDate, "Start Date")}`
+    : `  Amount:     ${fee}
+  Frequency:  ${v(c.billing, "Billing Frequency")}
+  Start date: ${v(c.startDate, "Start Date")}`;
+
+  const terms = oneTime
+    ? `  • This authorization covers a single charge and ends once that payment
+    is processed.
+  • Additional work requires a new written authorization.`
+    : `  • Charges recur per the frequency above until this authorization is
+    cancelled in writing with at least 10 days' notice before the next
+    billing date.
+  • You will be notified of any fee change at least 30 days in advance.`;
+
+  return `${header}
+
+Client: ${client}
 Provider: ${providerLine(s)}
 Date: ${todayLong()}
 
-I authorize ${providerLine(s)} to charge the payment method on file for
-bookkeeping services per the signed Engagement Letter.
+${authorize}
 
-  Amount:     ${fee}
-  Frequency:  ${billing}
-  Start date: ${v(c.startDate, "Start Date")}
+${schedule}
 
 PAYMENT METHOD (set up through our secure, PCI-compliant payment processor):
   [ ] ACH / bank transfer
@@ -537,10 +707,7 @@ HOW PAYMENT DETAILS ARE COLLECTED:
     send it by email or text. We do not store raw account numbers.
 
 TERMS:
-  • Charges recur per the frequency above until this authorization is
-    cancelled in writing with at least 10 days' notice before the next
-    billing date.
-  • You will be notified of any fee change at least 30 days in advance.
+${terms}
 
 Authorized by:
 
@@ -655,7 +822,18 @@ function Row({ children, cols }) {
   return <div className={`row row-${cols || children.length || 1}`}>{children}</div>;
 }
 
-function Field({ label, value, onChange, type, placeholder, required, mono }) {
+function Field({
+  label,
+  value,
+  onChange,
+  type,
+  placeholder,
+  required,
+  mono,
+  inputMode,
+  error,
+  note,
+}) {
   return (
     <label className="field">
       <span className="field-label">
@@ -663,12 +841,16 @@ function Field({ label, value, onChange, type, placeholder, required, mono }) {
         {required ? <span className="req"> *</span> : null}
       </span>
       <input
-        className={"input" + (mono ? " mono" : "")}
+        className={"input" + (mono ? " mono" : "") + (error ? " invalid" : "")}
         type={type || "text"}
+        inputMode={inputMode}
         value={value || ""}
         placeholder={placeholder || ""}
+        aria-invalid={error ? "true" : undefined}
         onChange={(e) => onChange(e.target.value)}
       />
+      {error ? <span className="field-error">{error}</span> : null}
+      {!error && note ? <span className="field-note">{note}</span> : null}
     </label>
   );
 }
@@ -708,13 +890,20 @@ function TextArea({ label, value, onChange, placeholder, rows }) {
   );
 }
 
+// Progress counts only tasks that apply to this client. Stored task states
+// are never changed, so an N/A task keeps its state if it applies again.
 function progressFor(client) {
-  const total = ONBOARDING_TASKS.length;
-  const done = ONBOARDING_TASKS.reduce(
+  const applicable = ONBOARDING_TASKS.filter((t) => taskApplies(t, client));
+  const total = applicable.length;
+  const done = applicable.reduce(
     (n, t) => n + (client.tasks && client.tasks[t.key] ? 1 : 0),
     0
   );
   return { done, total, pct: total ? Math.round((done / total) * 100) : 0 };
+}
+
+function needsNotesReview(c) {
+  return !c.notesReviewed && Boolean((c.notes || "").trim());
 }
 
 function statusClass(status) {
@@ -850,6 +1039,9 @@ function Clients({ clients, onNew, onOpen, onSettings, settingsReady }) {
                   <span className="mono">{c.contactName || "No contact"}</span>
                   {c.fee ? <span className="mono">{c.fee}</span> : null}
                 </div>
+                {needsNotesReview(c) ? (
+                  <span className="tag-review">Notes to review</span>
+                ) : null}
                 <div className="progress">
                   <div className="progress-bar">
                     <div
@@ -872,6 +1064,9 @@ function Clients({ clients, onNew, onOpen, onSettings, settingsReady }) {
 
 function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
   const [c, setC] = useState(initial);
+  // Two-click delete: browser confirm() dialogs are blocked in the artifact
+  // viewer (they return false), so confirmation lives in the page itself.
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const set = (k) => (val) => setC((prev) => ({ ...prev, [k]: val }));
 
   const toggleService = (key) => {
@@ -888,6 +1083,28 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
 
   const isEdit = Boolean(initial && initial.legalName);
 
+  const errors = {};
+  COUNT_FIELDS.forEach((k) => {
+    const e = countError(c[k]);
+    if (e) errors[k] = e;
+  });
+  const hasErrors = Object.keys(errors).length > 0;
+  const canSave = Boolean(c.legalName.trim()) && !hasErrors;
+  const feeWarning = feeBillingWarning(c);
+
+  const handleSave = () => {
+    if (!canSave) return;
+    const clean = { ...c };
+    COUNT_FIELDS.forEach((k) => {
+      clean[k] = (clean[k] == null ? "" : String(clean[k])).trim();
+    });
+    onSave(clean);
+  };
+
+  const saveHint = hasErrors ? (
+    <span className="save-hint">Fix the highlighted fields to save.</span>
+  ) : null;
+
   return (
     <div className="form-page">
       <header className="topbar">
@@ -902,14 +1119,19 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
         </div>
         <div className="top-actions">
           {onDelete ? (
-            <button className="btn danger" onClick={onDelete}>
-              Delete
+            <button
+              className="btn danger"
+              onClick={() => (confirmDelete ? onDelete() : setConfirmDelete(true))}
+              onBlur={() => setConfirmDelete(false)}
+            >
+              {confirmDelete ? "Click again to delete" : "Delete"}
             </button>
           ) : null}
+          {saveHint}
           <button
             className="btn primary"
-            onClick={() => onSave(c)}
-            disabled={!c.legalName.trim()}
+            onClick={handleSave}
+            disabled={!canSave}
           >
             Save Client
           </button>
@@ -1059,14 +1281,18 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             label="# Bank accounts"
             value={c.bankAccounts}
             onChange={set("bankAccounts")}
-            type="number"
+            inputMode="numeric"
+            placeholder="e.g. 2"
+            error={errors.bankAccounts}
             mono
           />
           <Field
             label="# Credit cards"
             value={c.ccAccounts}
             onChange={set("ccAccounts")}
-            type="number"
+            inputMode="numeric"
+            placeholder="e.g. 1"
+            error={errors.ccAccounts}
             mono
           />
           <Field
@@ -1099,8 +1325,9 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             label="Cleanup months"
             value={c.cleanupMonths}
             onChange={set("cleanupMonths")}
-            type="number"
+            inputMode="numeric"
             placeholder="0"
+            error={errors.cleanupMonths}
             mono
           />
         </Row>
@@ -1128,9 +1355,27 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             </label>
           ))}
         </div>
+        {hasAP(c) ? (
+          <Row cols={1}>
+            <label className="field">
+              <span className="field-label">Bill payment</span>
+              <select
+                className="input"
+                value={c.billPayAuthority || "client"}
+                onChange={(e) => set("billPayAuthority")(e.target.value)}
+              >
+                {BILL_PAY_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </Row>
+        ) : null}
         <Row cols={3}>
           <Select
-            label="Frequency"
+            label="Reporting frequency"
             value={c.frequency}
             onChange={set("frequency")}
             options={["Weekly", "Monthly", "Quarterly"]}
@@ -1140,6 +1385,7 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             value={c.fee}
             onChange={set("fee")}
             placeholder={settings.defaultFee || "$500 / mo"}
+            note={feeWarning}
             mono
           />
           <Select
@@ -1164,22 +1410,38 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             options={STATUSES}
           />
         </Row>
+        {needsNotesReview(c) ? (
+          <div className="notes-reminder">
+            This client has internal notes from before Special Terms existed.
+            If they include scope limits or terms the client should agree to,
+            copy them into Special terms &amp; limitations below. Internal
+            notes are never printed on client documents.
+          </div>
+        ) : null}
         <TextArea
-          label="Notes"
+          label="Special terms & limitations (printed in the engagement letter)"
+          value={c.specialTerms}
+          onChange={set("specialTerms")}
+          placeholder="e.g. Client approves and pays all vendor invoices."
+          rows={3}
+        />
+        <TextArea
+          label="Internal notes"
           value={c.notes}
           onChange={set("notes")}
-          placeholder="Internal notes…"
+          placeholder="Private. Not printed on client documents."
         />
       </FieldGroup>
 
       <div className="form-footer">
+        {saveHint}
         <button className="btn ghost" onClick={onCancel}>
           Cancel
         </button>
         <button
           className="btn primary"
-          onClick={() => onSave(c)}
-          disabled={!c.legalName.trim()}
+          onClick={handleSave}
+          disabled={!canSave}
         >
           Save Client
         </button>
@@ -1188,7 +1450,14 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
   );
 }
 
-function Detail({ client, settings, onEdit, onBack, onToggleTask }) {
+function Detail({
+  client,
+  settings,
+  onEdit,
+  onBack,
+  onToggleTask,
+  onMarkNotesReviewed,
+}) {
   const [activeDoc, setActiveDoc] = useState(DOCS[0].key);
   const [copied, setCopied] = useState(false);
 
@@ -1235,6 +1504,26 @@ function Detail({ client, settings, onEdit, onBack, onToggleTask }) {
         </div>
       </header>
 
+      {needsNotesReview(client) ? (
+        <div className="notes-reminder notes-callout">
+          <p>
+            <strong>Review internal notes.</strong> This client has internal
+            notes from before Special Terms existed. Internal notes never appear
+            in client documents. If they include scope limits or terms the
+            client should agree to, copy them into Special terms &amp;
+            limitations.
+          </p>
+          <div className="notes-actions">
+            <button className="btn small" onClick={onEdit}>
+              Review notes
+            </button>
+            <button className="btn small ghost" onClick={onMarkNotesReviewed}>
+              Mark reviewed
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <div className="detail-grid">
         <aside className="tracker">
           <div className="tracker-head">
@@ -1246,16 +1535,27 @@ function Detail({ client, settings, onEdit, onBack, onToggleTask }) {
           </div>
           <ul className="task-list">
             {ONBOARDING_TASKS.map((t) => {
-              const done = !!(client.tasks && client.tasks[t.key]);
+              const applies = taskApplies(t, client);
+              const done = applies && !!(client.tasks && client.tasks[t.key]);
               return (
                 <li key={t.key}>
-                  <label className={"task" + (done ? " done" : "")}>
+                  <label
+                    className={
+                      "task" + (done ? " done" : "") + (applies ? "" : " na")
+                    }
+                  >
                     <input
                       type="checkbox"
                       checked={done}
+                      disabled={!applies}
                       onChange={() => onToggleTask(t.key)}
                     />
-                    <span>{t.label}</span>
+                    <span>
+                      {t.label}
+                      {applies ? null : (
+                        <em className="na-note">Not applicable: {t.naReason}</em>
+                      )}
+                    </span>
                   </label>
                 </li>
               );
@@ -1424,7 +1724,20 @@ export default function App() {
         if (rawClients) {
           try {
             const parsed = JSON.parse(rawClients);
-            if (Array.isArray(parsed)) setClients(parsed);
+            if (Array.isArray(parsed))
+              setClients(
+                parsed.map((c) => ({
+                  ...blankClient(),
+                  ...c,
+                  tasks: { ...(c.tasks || {}) },
+                  // Legacy records predate this flag: flag them if they
+                  // have notes that may hold client-facing terms.
+                  notesReviewed:
+                    "notesReviewed" in c
+                      ? c.notesReviewed
+                      : !(c.notes || "").trim(),
+                }))
+              );
           } catch (e) {
             /* ignore corrupt value */
           }
@@ -1492,13 +1805,6 @@ export default function App() {
 
   const deleteClient = () => {
     if (!editing) return;
-    if (
-      typeof window !== "undefined" &&
-      window.confirm &&
-      !window.confirm("Delete this client? This cannot be undone.")
-    ) {
-      return;
-    }
     setClients((prev) => prev.filter((x) => x.id !== editing.id));
     setActiveId(null);
     setView("clients");
@@ -1508,9 +1814,15 @@ export default function App() {
     setClients((prev) =>
       prev.map((c) => {
         if (c.id !== activeId) return c;
-        const tasks = { ...c.tasks, [taskKey]: !c.tasks[taskKey] };
+        const tasks = { ...c.tasks, [taskKey]: !(c.tasks || {})[taskKey] };
         return { ...c, tasks };
       })
+    );
+  };
+
+  const markNotesReviewed = () => {
+    setClients((prev) =>
+      prev.map((c) => (c.id === activeId ? { ...c, notesReviewed: true } : c))
     );
   };
 
@@ -1561,6 +1873,7 @@ export default function App() {
           onEdit={openEdit}
           onBack={() => setView("clients")}
           onToggleTask={toggleTask}
+          onMarkNotesReviewed={markNotesReviewed}
         />
       ) : view === "settings" ? (
         <Settings
@@ -1750,6 +2063,23 @@ h3 { font-family: 'Fraunces', Georgia, serif; font-weight: 500; font-size: 18px;
 .textarea { resize: vertical; line-height: 1.5; }
 
 .check-field { justify-content: flex-end; }
+.input.invalid { border-color: var(--rust); background: #FBEDE3; }
+.input.invalid:focus { box-shadow: 0 0 0 3px #F4D9C8; }
+.field-error { font-size: 12px; color: #9A3F17; font-weight: 500; }
+.field-note { font-size: 12px; color: #8A6420; }
+.save-hint { font-size: 13px; color: #9A3F17; align-self: center; }
+
+.notes-reminder {
+  background: #FBF0DA; border: 1px solid var(--gold); border-radius: 10px;
+  padding: 12px 14px; font-size: 13px; color: #5C4413; line-height: 1.5;
+}
+.notes-callout { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.notes-callout p { margin: 0; flex: 1 1 320px; min-width: 0; }
+.notes-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.tag-review {
+  align-self: flex-start; font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  background: #FBF0DA; color: #8A6420; border-radius: 999px; padding: 3px 10px;
+}
 .checkbox { display: flex; align-items: center; gap: 8px; font-size: 14px; padding: 9px 0; }
 .checkbox input { width: 16px; height: 16px; accent-color: var(--green); }
 
@@ -1778,6 +2108,10 @@ h3 { font-family: 'Fraunces', Georgia, serif; font-weight: 500; font-size: 18px;
 .task:hover { background: var(--green-soft); }
 .task input { margin-top: 2px; accent-color: var(--green); width: 15px; height: 15px; }
 .task.done span { color: var(--ink-soft); text-decoration: line-through; }
+.task.na { cursor: default; opacity: .6; }
+.task.na:hover { background: transparent; }
+.task.na span { color: var(--ink-soft); }
+.na-note { display: block; font-style: normal; font-size: 12px; }
 
 .docpane {
   background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--radius);

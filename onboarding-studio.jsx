@@ -64,7 +64,7 @@ async function saveKey(key, value) {
 const SERVICES = [
   { key: "monthly_bookkeeping", label: "Monthly Bookkeeping & Reconciliation" },
   { key: "catchup_cleanup", label: "Catch-Up / Cleanup Bookkeeping" },
-  { key: "ap_management", label: "Accounts Payable / Bill Pay" },
+  { key: "ap_management", label: "Accounts Payable Management" },
   { key: "ar_invoicing", label: "Accounts Receivable / Invoicing" },
   { key: "payroll_support", label: "Payroll Processing Support" },
   { key: "financial_reporting", label: "Monthly Financial Reporting" },
@@ -109,6 +109,13 @@ const SOFTWARE = [
 ];
 
 const STATUSES = ["Lead", "Onboarding", "Active", "Paused"];
+
+// Who releases payments when Accounts Payable Management is selected.
+// "client" is the default: the bookkeeper holds no payment authority.
+const BILL_PAY_OPTIONS = [
+  { key: "client", label: "Client approves and pays all bills" },
+  { key: "provider", label: "We schedule payments the client has approved" },
+];
 
 /* ------------------------------------------------------------------ */
 /* Blank records                                                       */
@@ -166,6 +173,8 @@ function blankClient() {
     billing: "Monthly",
     startDate: "",
     status: "Lead",
+    billPayAuthority: "client",
+    specialTerms: "",
     notes: "",
     // Tracking
     tasks,
@@ -232,6 +241,15 @@ function selectedServices(c) {
   return SERVICES.filter((s) => c.services.includes(s.key));
 }
 
+function hasAP(c) {
+  return c.services.includes("ap_management");
+}
+
+function billPayLabel(c) {
+  const opt = BILL_PAY_OPTIONS.find((o) => o.key === c.billPayAuthority);
+  return (opt || BILL_PAY_OPTIONS[0]).label;
+}
+
 function bulletList(items) {
   return items.map((i) => `  • ${i}`).join("\n");
 }
@@ -246,6 +264,22 @@ function genEngagement(c, s) {
   const scope = services.length
     ? bulletList(services.map((x) => x.label))
     : "  • [No services selected yet — choose services on the client form]";
+
+  const apTerms = !hasAP(c)
+    ? ""
+    : c.billPayAuthority === "provider"
+    ? `
+Accounts payable: We will enter and track bills and schedule a payment only
+after you have approved it. You keep final authority over your accounts and
+remain responsible for having funds available.
+`
+    : `
+Accounts payable: We will enter and track bills and prepare a list of
+payments due for your review. You approve and release every payment. We will
+not initiate payments or hold payment authority on your accounts.
+`;
+
+  const specialTerms = (c.specialTerms || "").trim() || "None.";
 
   const fee = v(c.fee || s.defaultFee, "Monthly Fee");
   const billing = v(c.billing, "Billing Frequency");
@@ -273,7 +307,7 @@ provide bookkeeping services to ${v(c.legalName, "Client Legal Name")} ("you,"
 1. SCOPE OF SERVICES
 We will provide the following bookkeeping services:
 ${scope}
-
+${apTerms}
 Accounting basis: ${v(c.basis, "Cash/Accrual")}.
 Reporting frequency: ${v(c.frequency, "Frequency")}.
 Primary accounting software: ${v(c.software, "Software")}.
@@ -292,31 +326,34 @@ recommend you engage a licensed CPA, Enrolled Agent, or attorney. We are
 happy to coordinate with your tax professional and provide them with clean,
 reconciled books.
 
-3. CLIENT RESPONSIBILITIES
+3. SPECIAL TERMS & LIMITATIONS
+${specialTerms}
+
+4. CLIENT RESPONSIBILITIES
 You are responsible for the accuracy and completeness of the information and
 source documents you provide, for the safeguarding of assets, and for all
 management decisions. You will provide timely access to records and respond
 to our requests for clarification.
 
-4. FEES & BILLING
+5. FEES & BILLING
 Fee: ${fee}, billed ${billing}.
 Invoices are due upon receipt unless otherwise agreed. Recurring payment is
 authorized separately via the Payment Authorization form.
 
-5. TERM & TERMINATION
+6. TERM & TERMINATION
 This engagement begins on ${v(c.startDate, "Start Date")} and continues until
 terminated by either party with thirty (30) days' written notice. Upon
 termination, we will provide your books and records in a standard exportable
 format.
 
-6. CONFIDENTIALITY
+7. CONFIDENTIALITY
 We will keep your financial information confidential and will not disclose it
 except as required to perform the services or as required by law.
 
-7. GOVERNING LAW
+8. GOVERNING LAW
 This agreement is governed by the laws of the State of ${governing}.
 
-8. ACCEPTANCE
+9. ACCEPTANCE
 By signing below, both parties agree to the terms above.
 
 Client: ______________________________   Date: ______________
@@ -376,6 +413,8 @@ Frequency:         ${v(c.frequency, "Frequency")}
 Fee:               ${v(c.fee || s.defaultFee, "Fee")}
 Billing:           ${v(c.billing, "Billing")}
 Start date:        ${v(c.startDate, "Start Date")}
+Bill payment:      ${hasAP(c) ? billPayLabel(c) : "n/a (AP not selected)"}
+Special terms:     ${(c.specialTerms || "").trim() || "None"}
 
 ── NOTES ──
 ${c.notes ? c.notes : "[No notes]"}`;
@@ -494,7 +533,15 @@ ${
         )}. Please add us as a reports-only / accountant user.`
       : "No payroll access requested at this time."
   }
-
+${
+    hasAP(c) && c.billPayAuthority === "provider"
+      ? `
+4. BILL PAYMENT PLATFORM
+Add us with a role that can prepare payments. You keep approver rights, and
+no payment is released without your approval.
+`
+      : ""
+  }
 IMPORTANT SECURITY NOTES — PLEASE READ:
   • NEVER send us your passwords. We will never ask for them.
   • NEVER send full bank or credit card account numbers by email or text.
@@ -1135,6 +1182,24 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
             </label>
           ))}
         </div>
+        {hasAP(c) ? (
+          <Row cols={1}>
+            <label className="field">
+              <span className="field-label">Bill payment</span>
+              <select
+                className="input"
+                value={c.billPayAuthority || "client"}
+                onChange={(e) => set("billPayAuthority")(e.target.value)}
+              >
+                {BILL_PAY_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </Row>
+        ) : null}
         <Row cols={3}>
           <Select
             label="Frequency"
@@ -1172,10 +1237,17 @@ function ClientForm({ initial, settings, onSave, onCancel, onDelete }) {
           />
         </Row>
         <TextArea
-          label="Notes"
+          label="Special terms & limitations (printed in the engagement letter)"
+          value={c.specialTerms}
+          onChange={set("specialTerms")}
+          placeholder="e.g. Client approves and pays all vendor invoices."
+          rows={3}
+        />
+        <TextArea
+          label="Internal notes"
           value={c.notes}
           onChange={set("notes")}
-          placeholder="Internal notes…"
+          placeholder="Private. Not printed on client documents."
         />
       </FieldGroup>
 
@@ -1431,7 +1503,8 @@ export default function App() {
         if (rawClients) {
           try {
             const parsed = JSON.parse(rawClients);
-            if (Array.isArray(parsed)) setClients(parsed);
+            if (Array.isArray(parsed))
+              setClients(parsed.map((c) => ({ ...blankClient(), ...c })));
           } catch (e) {
             /* ignore corrupt value */
           }
